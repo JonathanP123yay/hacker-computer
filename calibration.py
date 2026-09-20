@@ -11,10 +11,14 @@ from gaze_utils import average_points, get_gaze, landmark_to_pixel
 def calibrate_monitor_mapping(camera, landmarker, verbose=False):
     targets = [
         (0.10, 0.10),
+        (0.50, 0.10),
         (0.90, 0.10),
-        (0.10, 0.90),
-        (0.90, 0.90),
+        (0.10, 0.50),
         (0.50, 0.50),
+        (0.90, 0.50),
+        (0.10, 0.90),
+        (0.50, 0.90),
+        (0.90, 0.90),
     ]
 
     samples = []

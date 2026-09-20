@@ -1,68 +1,120 @@
 import cv2
-import mediapipe as mp
 import os
 import sys
 import ctypes
-import time
 from contextlib import ExitStack
 
+# Lightweight imports that are always needed
 from calibration import calibrate_monitor_mapping
-from cursor_control import CursorController, trigger_mouse_click
+from consent import request_consent
+from cursor_control import CursorController
 from directx9_preview import DirectX9Preview
 from eye_3d import draw_eye_monitor_model
 from gesture_control import GestureController, draw_hand
-from gaze_utils import (
-    average_points,
-    get_blink_ratio,
-    get_gaze,
-    landmark_to_pixel,
-)
 import settings
+import os
+
+# Detect if a controller should be used for cursor control.
+use_controller = os.getenv("USE_CONTROLLER", "0") == "1"
+if use_controller:
+    try:
+        import pygame
+        pygame.init()
+        if pygame.joystick.get_count() > 0:
+            controller = pygame.joystick.Joystick(0)
+            controller.init()
+        else:
+            controller = None
+    except Exception as e:
+        print(f"Controller support unavailable: {e}")
+        controller = None
+from gaze_utils import average_points, get_gaze, landmark_to_pixel
+
+# Import Mediapipe only if eye tracking is enabled to avoid unnecessary startup cost.
+# Import Mediapipe only if eye tracking or hand gestures are enabled.
+if settings.EYE_TRACKING_ENABLED or os.path.exists(settings.HAND_MODEL_PATH):
+    import mediapipe as mp
+    BaseOptions = mp.tasks.BaseOptions
+    FaceLandmarker = mp.tasks.vision.FaceLandmarker
+    FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+
+    # Detect if a CUDA-capable GPU is available for Mediapipe delegation.
+    try:
+        import cv2.cuda as cuda
+        gpu_available = cuda.getCudaEnabledDeviceCount() > 0
+    except Exception:
+        gpu_available = False
 
 # =========================
 # Settings
 # =========================
 
 settings.configure(sys.argv[1:])
+
+if not request_consent():
+    print("Consent was not provided. Eye tracking stopped.")
+    raise SystemExit
+
+if not settings.request_settings():
+    print("Settings were not confirmed. Eye tracking stopped.")
+    raise SystemExit
+
 CALIBRATION_SAMPLES = []
 cursor_controller = CursorController(
     settings.CURSOR_SENSITIVITY,
     settings.CURSOR_SMOOTHING,
     settings.MOUSE_OVERRIDE_SECONDS
 )
+# Load addons after initializing core components.
+import importlib.util
+
+def load_addons():
+    addon_dir = os.path.join(os.getcwd(), "addons")
+    if not os.path.isdir(addon_dir):
+        return
+    for filename in os.listdir(addon_dir):
+        if filename.endswith(".py") and not filename.startswith("_"):
+            path = os.path.join(addon_dir, filename)
+            spec = importlib.util.spec_from_file_location(filename[:-3], path)
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(mod)
+                if hasattr(mod, "register"):
+                    mod.register(settings, cursor_controller)
+            except Exception as e:
+                print(f"Failed to load addon {filename}: {e}")
+
+load_addons()
 gesture_controller = GestureController()
 directx_preview = None
-try:
-    directx_preview = DirectX9Preview()
-    print("DirectX 9 eye model preview enabled.")
-except Exception as error:
-    print(f"DirectX 9 preview unavailable: {error}")
+if settings.EYE_TRACKING_ENABLED:
+    try:
+        directx_preview = DirectX9Preview()
+        print("DirectX 9 eye model preview enabled.")
+    except Exception as error:
+        print(f"DirectX 9 preview unavailable: {error}")
 
-# =========================
-# MediaPipe setup
-# =========================
 
-BaseOptions = mp.tasks.BaseOptions
-FaceLandmarker = mp.tasks.vision.FaceLandmarker
-FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-HandLandmarker = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
-
-if not os.path.exists(settings.MODEL_PATH):
+if settings.EYE_TRACKING_ENABLED and not os.path.exists(settings.MODEL_PATH):
     print(f"ERROR: Could not find {settings.MODEL_PATH}")
     print("Put face_landmarker.task in the same folder as main.py")
     input("Press Enter to exit...")
     raise SystemExit
 
-options = FaceLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=settings.MODEL_PATH),
-    running_mode=VisionRunningMode.IMAGE,
-    num_faces=1,
-    min_face_detection_confidence=0.5,
-    min_face_presence_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+options = None
+if settings.EYE_TRACKING_ENABLED:
+    delegate = mp.tasks.BaseOptions.Delegate.GPU if gpu_available else mp.tasks.BaseOptions.Delegate.CPU
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=settings.MODEL_PATH, delegate=delegate),
+        running_mode=VisionRunningMode.IMAGE,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
 
 # =========================
 # Helper functions
@@ -89,8 +141,14 @@ camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 print("Eye tracking started.")
 print("Press Q to quit.")
+print(
+    "Eye tracking: enabled."
+    if settings.EYE_TRACKING_ENABLED
+    else "Eye tracking: disabled. Gesture-only mode."
+)
 if os.path.exists(settings.HAND_MODEL_PATH):
-    print("Gestures enabled: point, two fingers, pinch, fist.")
+    print("Gestures: thumb-index tap = left click; hold pinch = drag.")
+    print("Two fingers = right click; fist = pause eye tracking.")
 else:
     print("Gestures disabled: hand_landmarker.task was not found.")
 debug_print("Verbose mode enabled.")
@@ -100,9 +158,11 @@ debug_print("Verbose mode enabled.")
 # =========================
 
 with ExitStack() as resources:
-    landmarker = resources.enter_context(
-        FaceLandmarker.create_from_options(options)
-    )
+    landmarker = None
+    if settings.EYE_TRACKING_ENABLED:
+        landmarker = resources.enter_context(
+            FaceLandmarker.create_from_options(options)
+        )
     hand_landmarker = None
     if os.path.exists(settings.HAND_MODEL_PATH):
         hand_options = HandLandmarkerOptions(
@@ -119,13 +179,14 @@ with ExitStack() as resources:
             HandLandmarker.create_from_options(hand_options)
         )
 
-    calibration = calibrate_monitor_mapping(
-        camera,
-        landmarker,
-        settings.VERBOSE
-    )
+    calibration = []
+    if settings.EYE_TRACKING_ENABLED:
+        calibration = calibrate_monitor_mapping(
+            camera,
+            landmarker,
+            settings.VERBOSE
+        )
     CALIBRATION_SAMPLES = calibration
-    blink_cooldown = 0
 
     while True:
         success, frame = camera.read()
@@ -139,32 +200,47 @@ with ExitStack() as resources:
 
         height, width, _ = frame.shape
 
-        # Convert BGR -> RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Handle controller input if enabled.
+        if use_controller and controller is not None:
+            pygame.event.pump()
+            try:
+                x = controller.get_axis(0)
+                y = controller.get_axis(1)
+                norm_x = (x + 1) / 2
+                norm_y = (y + 1) / 2
+                cursor_controller.move_from_gaze(norm_x, norm_y, CALIBRATION_SAMPLES)
+            except Exception as e:
+                print(f"Controller input error: {e}")
 
-        # Create MediaPipe image
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=rgb_frame
-        )
+        # Only perform MediaPipe processing when a detector exists.
+        if landmarker is not None or hand_landmarker is not None:
+            # Convert BGR -> RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Detect face landmarks
-        result = landmarker.detect(mp_image)
+            # Create MediaPipe image
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb_frame
+            )
 
-        gesture = "DISABLED"
-        if hand_landmarker is not None:
-            hand_result = hand_landmarker.detect(mp_image)
-            if hand_result.hand_landmarks:
-                hand = hand_result.hand_landmarks[0]
-                draw_hand(frame, hand)
-                gesture = gesture_controller.update(hand)
-            else:
-                gesture_controller.reset()
+            # Detect face landmarks
+            result = None
+            if landmarker is not None:
+                result = landmarker.detect(mp_image)
 
-        if result.face_landmarks:
-            debug_print("Face detected.")
+            gesture = "DISABLED"
+            if hand_landmarker is not None:
+                hand_result = hand_landmarker.detect(mp_image)
+                if hand_result.hand_landmarks:
+                    hand = hand_result.hand_landmarks[0]
+                    draw_hand(frame, hand)
+                    gesture = gesture_controller.update(hand)
+                else:
+                    gesture_controller.reset()
 
-            landmarks = result.face_landmarks[0]
+            if result is not None and result.face_landmarks:
+                debug_print("Face detected.")
+                landmarks = result.face_landmarks[0]
 
             # ==================================================
             # LEFT EYE
@@ -316,42 +392,8 @@ with ExitStack() as resources:
                     CALIBRATION_SAMPLES
                 )
 
-            # ==================================================
-            # BLINKING
-            # ==================================================
-
-            left_blink = get_blink_ratio(
-                left_corner,
-                right_corner,
-                left_top,
-                left_bottom,
-                left_top2,
-                left_bottom2
-            )
-
-            right_blink = get_blink_ratio(
-                right_eye_left,
-                right_eye_right,
-                right_top,
-                right_bottom,
-                right_top2,
-                right_bottom2
-            )
-
-            blink_ratio = (left_blink + right_blink) / 2
-
             if settings.VERBOSE:
-                debug_print(f"Gaze: x={gaze_x:.3f} y={gaze_y:.3f} blink={blink_ratio:.3f}")
-
-            # Approximate blink threshold
-            blinking = blink_ratio < 0.18
-
-            if blinking and blink_cooldown <= 0:
-                trigger_mouse_click()
-                blink_cooldown = 18
-                debug_print("Blink detected: mouse click")
-            elif blink_cooldown > 0:
-                blink_cooldown -= 1
+                debug_print(f"Gaze: x={gaze_x:.3f} y={gaze_y:.3f}")
 
             # ==================================================
             # DRAW IRIS
@@ -413,11 +455,7 @@ with ExitStack() as resources:
             # FACE CENTER
             # ==================================================
 
-            nose = landmark_to_pixel(
-                landmarks[1],
-                width,
-                height
-            )
+            nose = landmark_to_pixel(landmarks[1],width,height)
 
             cv2.circle(
                 frame,
@@ -468,21 +506,6 @@ with ExitStack() as resources:
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (255, 255, 255),
-                2
-            )
-
-            if blinking:
-                blink_text = "BLINKING"
-            else:
-                blink_text = "Eyes Open"
-
-            cv2.putText(
-                frame,
-                blink_text,
-                (20, 165),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (0, 255, 255),
                 2
             )
 

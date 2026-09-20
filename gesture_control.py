@@ -5,6 +5,7 @@ import time
 
 PINCH_THRESHOLD = 0.045
 CLICK_COOLDOWN = 0.35
+DRAG_HOLD_SECONDS = 0.25
 
 
 class GestureController:
@@ -14,6 +15,7 @@ class GestureController:
         self.last_right_click = 0.0
         self.left_button_down = False
         self.paused = False
+        self.pinch_started_at = None
 
     @staticmethod
     def distance(first, second):
@@ -75,23 +77,34 @@ class GestureController:
         if gesture == "FIST":
             self.paused = True
             self.release_drag()
+            self.pinch_started_at = None
         else:
             self.paused = False
 
-            if gesture == "POINT" and self.previous_gesture != "POINT":
-                if now - self.last_left_click >= CLICK_COOLDOWN:
-                    self.click("left")
-                    self.last_left_click = now
-            elif gesture == "TWO FINGER" and self.previous_gesture != "TWO FINGER":
+            if gesture == "TWO FINGER" and self.previous_gesture != "TWO FINGER":
                 if now - self.last_right_click >= CLICK_COOLDOWN:
                     self.click("right")
                     self.last_right_click = now
             elif gesture == "PINCH":
-                if not self.left_button_down:
+                if self.pinch_started_at is None:
+                    self.pinch_started_at = now
+                if (
+                    not self.left_button_down
+                    and now - self.pinch_started_at >= DRAG_HOLD_SECONDS
+                ):
                     self.button_down("left")
                     self.left_button_down = True
             else:
+                if (
+                    self.previous_gesture == "PINCH"
+                    and self.pinch_started_at is not None
+                    and not self.left_button_down
+                    and now - self.last_left_click >= CLICK_COOLDOWN
+                ):
+                    self.click("left")
+                    self.last_left_click = now
                 self.release_drag()
+                self.pinch_started_at = None
 
         self.previous_gesture = gesture
         return gesture
@@ -105,7 +118,7 @@ class GestureController:
         self.release_drag()
 
     def reset(self):
-        self.release_drag()
+        self.update(None)
         self.paused = False
         self.previous_gesture = "NONE"
 
